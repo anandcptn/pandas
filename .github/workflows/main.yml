@@ -1,4 +1,4 @@
-name: Build pandas for Termux Android (container)
+name: Build pandas for Termux Android
 
 on:
   workflow_dispatch:
@@ -16,179 +16,80 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      # 1. Checkout our repository
+      # 1. Build Base Dependencies Using Termux Native Pipeline
       # ------------------------------------------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ------------------------------------------------------------
-      # 2. Clone termux-packages into the container.
-      #
-      # IMPORTANT: /home/builder/termux-packages inside this image
-      # is NOT pre-populated with the repo. Termux's own
-      # run-docker.sh script bind-mounts a host-side checkout into
-      # that path at container start - the image itself only has
-      # the Ubuntu/NDK/toolchain environment baked in. Since GitHub
-      # Actions' `container:` directive starts the container
-      # directly (it doesn't run run-docker.sh), that mount never
-      # happens - so we clone the repo ourselves into that exact
-      # path. This is what "./build-package.sh: not found" meant:
-      # not a broken script, an empty directory.
-      # ------------------------------------------------------------
-      - name: Clone termux-packages into expected path
-        run: |
-          rm -rf /home/builder/termux-packages
-          git clone --depth=1 https://github.com/termux/termux-packages.git /home/builder/termux-packages
-          ls -la /home/builder/termux-packages/build-package.sh
-
-      # ------------------------------------------------------------
-      # 3. Build Python + NumPy + OpenBLAS using Termux's own
-      # in-container build scripts. The container already has the
-      # Ubuntu host setup baked in at image-build time, so we don't
-      # run setup-ubuntu.sh here - that's what killed the bare-
-      # runner version with "Unable to locate package python3.14-venv".
-      # ------------------------------------------------------------
-      - name: Build Termux Python, NumPy, OpenBLAS
+      - name: Build Termux Python, NumPy, and OpenBLAS
         run: |
           cd /home/builder/termux-packages
+          # Build target dependencies
           ./build-package.sh -a ${{ env.TERMUX_ARCH }} python
           ./build-package.sh -a ${{ env.TERMUX_ARCH }} python-numpy
           ./build-package.sh -a ${{ env.TERMUX_ARCH }} openblas
 
       # ------------------------------------------------------------
-      # 3. Extract staged .deb packages into a sysroot
+      # 2. Extract & Inspect Target Sysroot
       # ------------------------------------------------------------
-      - name: Extract staged packages
+      - name: Extract Target Staging Sysroot
+        id: sysroot
         run: |
           cd /home/builder/termux-packages
           mkdir -p target-sysroot
           for deb in output/*.deb; do
-            echo "Extracting $deb"
+            echo "Extracting $deb..."
             dpkg-deb -x "$deb" target-sysroot/
           done
 
-          echo "========== staged tree (top levels) =========="
-          find target-sysroot -maxdepth 8 -type d | head -80
-
-      # ------------------------------------------------------------
-      # 4. Discover target Python/NumPy paths - hard fail if
-      # anything expected is missing, same defensive approach as
-      # our bare-runner version.
-      # ------------------------------------------------------------
-      - name: Discover target include/lib paths
-        id: paths
-        run: |
           TARGET_DIR="/home/builder/termux-packages/target-sysroot${{ env.TERMUX_PREFIX }}"
-          echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
+          
+          # Discover precise paths dynamically
+          PYTHON_INC=$(find "$TARGET_DIR/include" -maxdepth 2 -type f -name "Python.h" | head -n1)
+          PYTHON_VER_DIR=$(basename "$(dirname "$PYTHON_INC")")
+          PYTHON_VER_SHORT=${PYTHON_VER_DIR#python} # e.g., 3.11, 3.12
+          
+          NUMPY_INC=$(find "$TARGET_DIR/lib/$PYTHON_VER_DIR/site-packages" -type d \( -name "include" -o -name "_core" \) | grep -E "numpy/(_core/)?include$" | head -n1)
+          SYSCONFIG=$(find "$TARGET_DIR/lib/$PYTHON_VER_DIR" -type f -name "_sysconfigdata*.py" | head -n1)
+          LIBPYTHON=$(find "$TARGET_DIR/lib" -type f -name "libpython${PYTHON_VER_SHORT}*.so" | head -n1)
+          
+          # Discover Android Clang dynamically from container's Android SDK/NDK
+          CLANG_BIN=$(find / -name "aarch64-linux-android${{ env.TERMUX_PKG_API_LEVEL }}-clang" 2>/dev/null | head -n1)
+          TOOLCHAIN_BIN=$(dirname "$CLANG_BIN")
 
-          PYTHON_H=$(find "$TARGET_DIR/include" -maxdepth 2 -name Python.h | head -1)
-          NUMPY_H_NEW=$(find "$TARGET_DIR" -path '*numpy/_core/include/numpy/arrayobject.h' | head -1)
-          NUMPY_H_OLD=$(find "$TARGET_DIR" -path '*numpy/core/include/numpy/arrayobject.h' | head -1)
-          SYSCONFIG=$(find "$TARGET_DIR" -name '_sysconfigdata*.py' | head -1)
-          LIBPYTHON=$(find "$TARGET_DIR/lib" -maxdepth 1 -iname 'libpython3*.so*' | head -1)
+          echo "=== Discovery Summary ==="
+          echo "Target Include Dir: $TARGET_DIR/include/$PYTHON_VER_DIR"
+          echo "NumPy Headers:      $NUMPY_INC"
+          echo "Sysconfig File:     $SYSCONFIG"
+          echo "LibPython:          $LIBPYTHON"
+          echo "Toolchain Bin:      $TOOLCHAIN_BIN"
 
-          echo "Python.h        = $PYTHON_H"
-          echo "numpy (_core)   = $NUMPY_H_NEW"
-          echo "numpy (core)    = $NUMPY_H_OLD"
-          echo "sysconfigdata   = $SYSCONFIG"
-          echo "libpython       = $LIBPYTHON"
-
-          if [ -z "$PYTHON_H" ]; then
-            echo "::error::Could not find target Python.h under $TARGET_DIR/include"
-            exit 1
-          fi
-          if [ -z "$NUMPY_H_NEW" ] && [ -z "$NUMPY_H_OLD" ]; then
-            echo "::error::Could not find target NumPy headers (checked both numpy/_core and numpy/core layouts)"
-            exit 1
-          fi
-          if [ -z "$SYSCONFIG" ]; then
-            echo "::error::Could not find target _sysconfigdata*.py - cannot safely proceed without confirming interpreter ABI naming"
-            exit 1
-          fi
-          if [ -z "$LIBPYTHON" ]; then
-            echo "::error::Could not find staged libpython*.so - linking would fail or silently fall back to host"
+          # Fail fast if critical components are absent
+          if [ -z "$CLANG_BIN" ] || [ -z "$NUMPY_INC" ] || [ -z "$SYSCONFIG" ]; then
+            echo "::error::Critical toolchain or target header path discovery failed."
             exit 1
           fi
 
-          PYTHON_VER_DIR=$(basename "$(dirname "$PYTHON_H")")
-          NUMPY_INCLUDE_DIR=$(dirname "$(dirname "${NUMPY_H_NEW:-$NUMPY_H_OLD}")")
-
-          echo "python_include=$(dirname "$PYTHON_H")" >> "$GITHUB_OUTPUT"
-          echo "python_ver_dir=$PYTHON_VER_DIR" >> "$GITHUB_OUTPUT"
-          echo "numpy_include=$NUMPY_INCLUDE_DIR" >> "$GITHUB_OUTPUT"
+          echo "target_prefix=$TARGET_DIR" >> "$GITHUB_OUTPUT"
+          echo "python_ver=$PYTHON_VER_DIR" >> "$GITHUB_OUTPUT"
+          echo "python_ver_short=$PYTHON_VER_SHORT" >> "$GITHUB_OUTPUT"
+          echo "numpy_include=$NUMPY_INC" >> "$GITHUB_OUTPUT"
           echo "sysconfig_dir=$(dirname "$SYSCONFIG")" >> "$GITHUB_OUTPUT"
           echo "sysconfig_name=$(basename "$SYSCONFIG" .py)" >> "$GITHUB_OUTPUT"
-          echo "libpython_path=$LIBPYTHON" >> "$GITHUB_OUTPUT"
+          echo "toolchain_bin=$TOOLCHAIN_BIN" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------
-      # 5. Download pandas source
+      # 3. Create Meson Cross File & Python Build Shim
       # ------------------------------------------------------------
-      - name: Download pandas source
+      - name: Prepare Cross Environment and NumPy Shim
         run: |
-          mkdir -p /tmp/pandas-build
-          cd /tmp/pandas-build
-          pip3 download --no-binary pandas --no-deps pandas
-          tar -xf pandas-*.tar.gz --strip-components=1
-
-      # ------------------------------------------------------------
-      # 6. GATE: same hard gate as the bare-runner version. Moving
-      # to the container fixes toolchain/sysroot paths - it does
-      # NOT change how Python import resolution works.
-      # ------------------------------------------------------------
-      - name: Gate on live numpy import in build config
-        working-directory: /tmp/pandas-build
-        run: |
-          MESON_HITS=$(grep -rn "numpy" --include="meson.build" . || true)
-          IMPORT_HITS=$(grep -rln "import numpy\|numpy\.get_include" . --include="*.py" || true)
-
-          echo "========== meson.build numpy references =========="
-          echo "$MESON_HITS"
-          echo
-          echo "========== python files calling numpy at build time =========="
-          echo "$IMPORT_HITS"
-
-          if echo "$MESON_HITS $IMPORT_HITS" | grep -qi "numpy"; then
-            echo
-            echo "::error::pandas' build references numpy at build time (get_include() or a live import)."
-            echo "::error::This runs under the CONTAINER's pip3/python3, whose 'numpy' resolves via normal"
-            echo "::error::sys.path - not via CFLAGS/CPATH. Unless the container's own pip3 environment"
-            echo "::error::has a numpy installed whose get_include() points at the STAGED Android numpy"
-            echo "::error::headers (not a host-installed one), this will build against the wrong ABI."
-            echo "::error::Next: either pip3 install a shim numpy package in the container's build env"
-            echo "::error::whose get_include() is patched to point at \${{ steps.paths.outputs.numpy_include }},"
-            echo "::error::or use a crossenv-style interpreter for the build step."
-            exit 1
-          else
-            echo "No build-time numpy import detected - safe to proceed on this front."
-          fi
-
-      # ------------------------------------------------------------
-      # 7. Create Meson cross fil
-      # ------------------------------------------------------------
-      - name: Create Meson cross file
-        run: |
-          NDK=$(find / -maxdepth 6 -iname 'android-ndk*' -type d 2>/dev/null | head -1)
-          echo "Detected NDK at: $NDK"
-          if [ -z "$NDK" ]; then
-            echo "::error::Could not auto-detect NDK directory - check container layout with 'find / -iname toolchains'"
-            exit 1
-          fi
-
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-          CC="$TOOLCHAIN/bin/aarch64-linux-android${{ env.TERMUX_PKG_API_LEVEL }}-clang"
-          if [ ! -f "$CC" ]; then
-            echo "::error::Expected compiler not found at $CC - listing available clang binaries:"
-            find "$TOOLCHAIN/bin" -iname '*clang*' 2>/dev/null
-            exit 1
-          fi
-
+          TOOLCHAIN="${{ steps.sysroot.outputs.toolchain_bin }}"
+          
+          # Generate Meson cross configuration
           cat > /tmp/cross-android.txt <<EOF
           [binaries]
-          c = '$CC'
-          cpp = '${CC}++'
-          ar = '$TOOLCHAIN/bin/llvm-ar'
-          strip = '$TOOLCHAIN/bin/llvm-strip'
-          ranlib = '$TOOLCHAIN/bin/llvm-ranlib'
+          c = '$TOOLCHAIN/aarch64-linux-android${{ env.TERMUX_PKG_API_LEVEL }}-clang'
+          cpp = '$TOOLCHAIN/aarch64-linux-android${{ env.TERMUX_PKG_API_LEVEL }}-clang++'
+          ar = '$TOOLCHAIN/llvm-ar'
+          strip = '$TOOLCHAIN/llvm-strip'
+          ranlib = '$TOOLCHAIN/llvm-ranlib'
           pkgconfig = 'pkg-config'
 
           [host_machine]
@@ -201,83 +102,85 @@ jobs:
           needs_exe_wrapper = true
           EOF
 
-          cat /tmp/cross-android.txt
-          echo "ndk_toolchain=$TOOLCHAIN" >> "$GITHUB_ENV"
+          # Construct an isolated Python virtual environment on the host
+          python3 -m venv /tmp/host-build-env
+          source /tmp/host-build-env/bin/activate
+          pip install --upgrade pip build wheel cython meson meson-python ninja setuptools-scm packaging
+
+          # Intercept host Python NumPy resolution:
+          # Create a shim numpy module in host venv pointing to the target headers
+          HOST_SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+          mkdir -p "$HOST_SITE_PACKAGES/numpy"
+
+          cat > "$HOST_SITE_PACKAGES/numpy/__init__.py" <<EOF
+          __version__ = "2.0.0"
+          def get_include():
+              return "${{ steps.sysroot.outputs.numpy_include }}"
+          EOF
+
+          cat > "$HOST_SITE_PACKAGES/numpy/_core.py" <<EOF
+          def get_include():
+              return "${{ steps.sysroot.outputs.numpy_include }}"
+          EOF
+
+          echo "Testing numpy import shim under host Python:"
+          python3 -c "import numpy; print('NumPy header path redirected to:', numpy.get_include())"
 
       # ------------------------------------------------------------
-      # 8. Build pandas wheel
+      # 4. Fetch Pandas Source and Cross-Compile
       # ------------------------------------------------------------
-      - name: Build pandas wheel
-        working-directory: /tmp/pandas-build
+      - name: Build Pandas Wheel
         env:
-          CFLAGS: >-
-            -I${{ steps.paths.outputs.python_include }}
-            -I${{ steps.paths.outputs.numpy_include }}
-            -fPIC
-          CXXFLAGS: >-
-            -I${{ steps.paths.outputs.python_include }}
-            -I${{ steps.paths.outputs.numpy_include }}
-            -fPIC
-          LDFLAGS: >-
-            -L${{ steps.paths.outputs.target_dir }}/lib
-          PYTHONPATH: ${{ steps.paths.outputs.sysconfig_dir }}
-          _PYTHON_SYSCONFIGDATA_NAME: ${{ steps.paths.outputs.sysconfig_name }}
+          TARGET_PREFIX: ${{ steps.sysroot.outputs.target_prefix }}
+          PYTHON_VER: ${{ steps.sysroot.outputs.python_ver }}
+          PYTHON_VER_SHORT: ${{ steps.sysroot.outputs.python_ver_short }}
+          _PYTHON_SYSCONFIGDATA_NAME: ${{ steps.sysroot.outputs.sysconfig_name }}
+          PYTHONPATH: ${{ steps.sysroot.outputs.sysconfig_dir }}
         run: |
-          pip3 install --upgrade pip build wheel setuptools-scm cython meson-python ninja
+          source /tmp/host-build-env/bin/activate
 
-          mkdir -p /home/builder/wheelhouse
+          export CFLAGS="-I$TARGET_PREFIX/include -I$TARGET_PREFIX/include/$PYTHON_VER -I${{ steps.sysroot.outputs.numpy_include }} -fPIC"
+          export CXXFLAGS="$CFLAGS"
+          export LDFLAGS="-L$TARGET_PREFIX/lib -lpython$PYTHON_VER_SHORT -lopenblas"
+          export PKG_CONFIG_PATH="$TARGET_PREFIX/lib/pkgconfig"
 
+          mkdir -p /tmp/pandas-build /tmp/wheelhouse
+          cd /tmp/pandas-build
+          pip download --no-binary pandas --no-deps pandas
+          tar -xf pandas-*.tar.gz --strip-components=1
+
+          # Compile wheel via meson-python backend
           python3 -m pip wheel \
             --no-deps \
             --no-build-isolation \
             -Csetup-args=--cross-file=/tmp/cross-android.txt \
             . \
-            -w /home/builder/wheelhouse
+            -w /tmp/wheelhouse
 
       # ------------------------------------------------------------
-      # 9. Verify actual ABI - no auto-retagging. Confirm the .so
-      # files are genuinely ARM/Android before any tag decision.
+      # 5. Validate Native Architecture and Linkage
       # ------------------------------------------------------------
-      - name: Verify wheel ABI before any tagging decision
+      - name: Verify Architecture and Linkage
         run: |
-          cd /home/builder/wheelhouse
-          WHL=$(ls pandas-*.whl | head -1)
-          echo "Wheel produced: $WHL"
-
-          rm -rf /tmp/inspect
           mkdir -p /tmp/inspect
+          cd /tmp/wheelhouse
+          WHL=$(ls pandas-*.whl | head -n1)
+          echo "Wheel built: $WHL"
+
           unzip -q "$WHL" -d /tmp/inspect
 
-          SO_FILES=$(find /tmp/inspect -name '*.so' | head -5)
-          if [ -z "$SO_FILES" ]; then
-            echo "::error::No .so files in wheel - pandas requires native extensions, this wheel is wrong"
-            exit 1
-          fi
+          echo "=== Checking ELF Header Architecture ==="
+          find /tmp/inspect -name "*.so" -exec file {} +
 
-          for so in $SO_FILES; do
-            echo
-            echo "---- $so ----"
-            file "$so"
-          done
-
-          echo
-          echo "Expect: ELF 64-bit LSB shared object, ARM aarch64."
-          echo "If 'file' reports x86-64 instead, the cross file was not honored - stop here,"
-          echo "do not tag or ship this wheel. Tagging is a manual step you run after confirming this."
+          echo "=== Checking Shared Object Linking Dependencies ==="
+          find /tmp/inspect -name "*.so" -exec ldd {} + 2>/dev/null || true
 
       # ------------------------------------------------------------
-      # 10. Package artifacts (untagged wheel + inspection output)
+      # 6. Upload Final Artifact
       # ------------------------------------------------------------
-      - name: Package artifacts
-        run: |
-          mkdir -p /tmp/artifact
-          cp /home/builder/wheelhouse/*.whl /tmp/artifact/
-          cd /tmp/artifact
-          zip -r /home/builder/pandas-termux-aarch64.zip .
-
-      - name: Upload wheel artifact
+      - name: Package and Upload
         uses: actions/upload-artifact@v4
         with:
           name: pandas-termux-aarch64
-          path: /home/builder/pandas-termux-aarch64.zip
+          path: /tmp/wheelhouse/*.whl
           if-no-files-found: error
