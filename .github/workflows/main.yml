@@ -22,7 +22,27 @@ jobs:
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------
-      # 2. Build Python + NumPy + OpenBLAS using Termux's own
+      # 2. Clone termux-packages into the container.
+      #
+      # IMPORTANT: /home/builder/termux-packages inside this image
+      # is NOT pre-populated with the repo. Termux's own
+      # run-docker.sh script bind-mounts a host-side checkout into
+      # that path at container start - the image itself only has
+      # the Ubuntu/NDK/toolchain environment baked in. Since GitHub
+      # Actions' `container:` directive starts the container
+      # directly (it doesn't run run-docker.sh), that mount never
+      # happens - so we clone the repo ourselves into that exact
+      # path. This is what "./build-package.sh: not found" meant:
+      # not a broken script, an empty directory.
+      # ------------------------------------------------------------
+      - name: Clone termux-packages into expected path
+        run: |
+          rm -rf /home/builder/termux-packages
+          git clone --depth=1 https://github.com/termux/termux-packages.git /home/builder/termux-packages
+          ls -la /home/builder/termux-packages/build-package.sh
+
+      # ------------------------------------------------------------
+      # 3. Build Python + NumPy + OpenBLAS using Termux's own
       # in-container build scripts. The container already has the
       # Ubuntu host setup baked in at image-build time, so we don't
       # run setup-ubuntu.sh here - that's what killed the bare-
@@ -113,10 +133,7 @@ jobs:
       # ------------------------------------------------------------
       # 6. GATE: same hard gate as the bare-runner version. Moving
       # to the container fixes toolchain/sysroot paths - it does
-      # NOT change how Python import resolution works. If pandas'
-      # meson.build imports numpy live, we still need to solve that
-      # before producing a wheel, or we're just building the wrong
-      # thing in a nicer environment.
+      # NOT change how Python import resolution works.
       # ------------------------------------------------------------
       - name: Gate on live numpy import in build config
         working-directory: /tmp/pandas-build
@@ -146,7 +163,7 @@ jobs:
           fi
 
       # ------------------------------------------------------------
-      # 7. Create Meson cross file
+      # 7. Create Meson cross fil
       # ------------------------------------------------------------
       - name: Create Meson cross file
         run: |
