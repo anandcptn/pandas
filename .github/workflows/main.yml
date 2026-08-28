@@ -1,203 +1,178 @@
-name: Build pandas for Termux Android
+name: Build pandas for Termux Android (container)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/termux/package-builder:latest
 
     env:
       TERMUX_ARCH: aarch64
       TERMUX_PKG_API_LEVEL: "24"
+      TERMUX_PREFIX: /data/data/com.termux/files/usr
 
     steps:
       # ------------------------------------------------------------
       # 1. Checkout our repository
       # ------------------------------------------------------------
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------
-      # 2. Get Termux's Android package build system
+      # 2. Build Python + NumPy + OpenBLAS using Termux's own
+      # in-container build scripts. The container already has the
+      # Ubuntu host setup baked in at image-build time, so we don't
+      # run setup-ubuntu.sh here - that's what killed the bare-
+      # runner version with "Unable to locate package python3.14-venv".
       # ------------------------------------------------------------
-      - name: Clone Termux packages
+      - name: Build Termux Python, NumPy, OpenBLAS
         run: |
-          git clone --depth=1 \
-            https://github.com/termux/termux-packages.git
+          cd /home/builder/termux-packages
+          ./build-package.sh -a ${{ env.TERMUX_ARCH }} python
+          ./build-package.sh -a ${{ env.TERMUX_ARCH }} python-numpy
+          ./build-package.sh -a ${{ env.TERMUX_ARCH }} openblas
 
       # ------------------------------------------------------------
-      # 3. Install the Ubuntu-side dependencies required by
-      #    Termux's package builder
-      # ------------------------------------------------------------
-      - name: Setup Termux build environment
-        working-directory: termux-packages
-        run: |
-          ./scripts/setup-ubuntu.sh
-
-      # ------------------------------------------------------------
-      # 4. Build Python for the target architecture
-      #
-      # NOTE: confirm Termux actually has a python recipe pinned to
-      # 3.14 before running this for real - check
-      # termux-packages/packages/python/build.sh for the version.
-      # If it's not there yet, this step will build whatever
-      # version *is* pinned, and everything downstream (sysconfig
-      # tag, wheel tag) needs to match that instead of cp314.
-      # ------------------------------------------------------------
-      - name: Build target Python
-        working-directory: termux-packages
-        run: |
-          ./build-package.sh -a aarch64 python
-
-      # ------------------------------------------------------------
-      # 5. Build NumPy for Android/aarch64
-      #
-      # This is a real Termux package build (not a bare download),
-      # so the resulting .deb has headers/libs built against the
-      # NDK toolchain for the correct target.
-      # ------------------------------------------------------------
-      - name: Build target NumPy
-        working-directory: termux-packages
-        run: |
-          ./build-package.sh -a aarch64 python-numpy
-
-      # ------------------------------------------------------------
-      # 6. Extract the staged .deb packages
-      #
-      # build-package.sh produces .deb archives in output/, not
-      # loose files - dpkg-deb -x unpacks them so we can actually
-      # find headers/libs inside.
+      # 3. Extract staged .deb packages into a sysroot
       # ------------------------------------------------------------
       - name: Extract staged packages
-        working-directory: termux-packages
         run: |
-          mkdir -p staged
+          cd /home/builder/termux-packages
+          mkdir -p target-sysroot
           for deb in output/*.deb; do
             echo "Extracting $deb"
-            dpkg-deb -x "$deb" staged/
+            dpkg-deb -x "$deb" target-sysroot/
           done
 
           echo "========== staged tree (top levels) =========="
-          find staged -maxdepth 6 -type d | head -50
+          find target-sysroot -maxdepth 8 -type d | head -80
 
       # ------------------------------------------------------------
-      # 7. Inspect exactly what got staged
+      # 4. Discover target Python/NumPy paths - hard fail if
+      # anything expected is missing, same defensive approach as
+      # our bare-runner version.
       # ------------------------------------------------------------
-      - name: Inspect staged target files
-        working-directory: termux-packages
+      - name: Discover target include/lib paths
+        id: paths
         run: |
-          echo "========== Python headers =========="
-          find staged -type f \
-            \( -name 'Python.h' -o -name 'pyconfig.h' \) \
-            -print 2>/dev/null | head -50
+          TARGET_DIR="/home/builder/termux-packages/target-sysroot${{ env.TERMUX_PREFIX }}"
+          echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
 
-          echo
-          echo "========== Python libraries =========="
-          find staged -type f \
-            \( -iname 'libpython3*.so*' -o -iname 'libpython3*.a' \) \
-            -print 2>/dev/null | head -50
+          PYTHON_H=$(find "$TARGET_DIR/include" -maxdepth 2 -name Python.h | head -1)
+          NUMPY_H_NEW=$(find "$TARGET_DIR" -path '*numpy/_core/include/numpy/arrayobject.h' | head -1)
+          NUMPY_H_OLD=$(find "$TARGET_DIR" -path '*numpy/core/include/numpy/arrayobject.h' | head -1)
+          SYSCONFIG=$(find "$TARGET_DIR" -name '_sysconfigdata*.py' | head -1)
+          LIBPYTHON=$(find "$TARGET_DIR/lib" -maxdepth 1 -iname 'libpython3*.so*' | head -1)
 
-          echo
-          echo "========== sysconfigdata =========="
-          find staged -type f -name '_sysconfigdata*.py' \
-            -print 2>/dev/null | head -20
+          echo "Python.h        = $PYTHON_H"
+          echo "numpy (_core)   = $NUMPY_H_NEW"
+          echo "numpy (core)    = $NUMPY_H_OLD"
+          echo "sysconfigdata   = $SYSCONFIG"
+          echo "libpython       = $LIBPYTHON"
 
-          echo
-          echo "========== NumPy headers =========="
-          find staged -type f \
-            \( -name 'arrayobject.h' -o -name 'ndarraytypes.h' \) \
-            -print 2>/dev/null | head -50
+          if [ -z "$PYTHON_H" ]; then
+            echo "::error::Could not find target Python.h under $TARGET_DIR/include"
+            exit 1
+          fi
+          if [ -z "$NUMPY_H_NEW" ] && [ -z "$NUMPY_H_OLD" ]; then
+            echo "::error::Could not find target NumPy headers (checked both numpy/_core and numpy/core layouts)"
+            exit 1
+          fi
+          if [ -z "$SYSCONFIG" ]; then
+            echo "::error::Could not find target _sysconfigdata*.py - cannot safely proceed without confirming interpreter ABI naming"
+            exit 1
+          fi
+          if [ -z "$LIBPYTHON" ]; then
+            echo "::error::Could not find staged libpython*.so - linking would fail or silently fall back to host"
+            exit 1
+          fi
 
-          echo
-          echo "========== Native libraries =========="
-          find staged -type f -name '*.so' \
-            -print 2>/dev/null | head -100
+          PYTHON_VER_DIR=$(basename "$(dirname "$PYTHON_H")")
+          NUMPY_INCLUDE_DIR=$(dirname "$(dirname "${NUMPY_H_NEW:-$NUMPY_H_OLD}")")
+
+          echo "python_include=$(dirname "$PYTHON_H")" >> "$GITHUB_OUTPUT"
+          echo "python_ver_dir=$PYTHON_VER_DIR" >> "$GITHUB_OUTPUT"
+          echo "numpy_include=$NUMPY_INCLUDE_DIR" >> "$GITHUB_OUTPUT"
+          echo "sysconfig_dir=$(dirname "$SYSCONFIG")" >> "$GITHUB_OUTPUT"
+          echo "sysconfig_name=$(basename "$SYSCONFIG" .py)" >> "$GITHUB_OUTPUT"
+          echo "libpython_path=$LIBPYTHON" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------
-      # 8. Locate the Android NDK compiler
-      # ------------------------------------------------------------
-      - name: Locate Android compiler
-        working-directory: termux-packages
-        run: |
-          find build-tools -type f \
-            \( -name 'clang' -o -name 'clang++' \) \
-            -print 2>/dev/null | head -20
-
-      # ------------------------------------------------------------
-      # 9. Download pandas SOURCE from PyPI
+      # 5. Download pandas source
       # ------------------------------------------------------------
       - name: Download pandas source
         run: |
-          python3 -m pip download \
-            --no-binary pandas \
-            --no-deps \
-            pandas \
-            -d source
-
-          mkdir -p pandas-src
-
-          tar -xf source/pandas-*.tar.gz \
-            -C pandas-src \
-            --strip-components=1
+          mkdir -p /tmp/pandas-build
+          cd /tmp/pandas-build
+          pip3 download --no-binary pandas --no-deps pandas
+          tar -xf pandas-*.tar.gz --strip-components=1
 
       # ------------------------------------------------------------
-      # 10. Discover the actual staged Python/NumPy paths
-      #
-      # This step hard-fails with ::error:: if anything is missing,
-      # rather than silently building against the wrong headers.
+      # 6. GATE: same hard gate as the bare-runner version. Moving
+      # to the container fixes toolchain/sysroot paths - it does
+      # NOT change how Python import resolution works. If pandas'
+      # meson.build imports numpy live, we still need to solve that
+      # before producing a wheel, or we're just building the wrong
+      # thing in a nicer environment.
       # ------------------------------------------------------------
-      - name: Discover target include paths
-        id: paths
-        working-directory: termux-packages
+      - name: Gate on live numpy import in build config
+        working-directory: /tmp/pandas-build
         run: |
-          PYTHON_H=$(find staged -type f -name Python.h | head -1)
-          NUMPY_H=$(find staged -type f -name arrayobject.h | head -1)
-          SYSCONFIG=$(find staged -type f -name '_sysconfigdata*.py' | head -1)
+          MESON_HITS=$(grep -rn "numpy" --include="meson.build" . || true)
+          IMPORT_HITS=$(grep -rln "import numpy\|numpy\.get_include" . --include="*.py" || true)
 
-          echo "Python.h        = $PYTHON_H"
-          echo "arrayobject.h   = $NUMPY_H"
-          echo "sysconfigdata   = $SYSCONFIG"
+          echo "========== meson.build numpy references =========="
+          echo "$MESON_HITS"
+          echo
+          echo "========== python files calling numpy at build time =========="
+          echo "$IMPORT_HITS"
 
-          if [ -z "$PYTHON_H" ]; then
-            echo "::error::Could not find target Python.h in staged/ - check step 4 actually produced a python .deb"
+          if echo "$MESON_HITS $IMPORT_HITS" | grep -qi "numpy"; then
+            echo
+            echo "::error::pandas' build references numpy at build time (get_include() or a live import)."
+            echo "::error::This runs under the CONTAINER's pip3/python3, whose 'numpy' resolves via normal"
+            echo "::error::sys.path - not via CFLAGS/CPATH. Unless the container's own pip3 environment"
+            echo "::error::has a numpy installed whose get_include() points at the STAGED Android numpy"
+            echo "::error::headers (not a host-installed one), this will build against the wrong ABI."
+            echo "::error::Next: either pip3 install a shim numpy package in the container's build env"
+            echo "::error::whose get_include() is patched to point at \${{ steps.paths.outputs.numpy_include }},"
+            echo "::error::or use a crossenv-style interpreter for the build step."
             exit 1
+          else
+            echo "No build-time numpy import detected - safe to proceed on this front."
           fi
-
-          if [ -z "$NUMPY_H" ]; then
-            echo "::error::Could not find target NumPy headers in staged/ - check step 5 actually produced a python-numpy .deb"
-            exit 1
-          fi
-
-          if [ -z "$SYSCONFIG" ]; then
-            echo "::error::Could not find target _sysconfigdata*.py - Termux's python build may not ship it. Cross-build cannot correctly tag the interpreter without this; stop and investigate rather than continuing blind."
-            exit 1
-          fi
-
-          PYTHON_INCLUDE=$(dirname "$PYTHON_H")
-          NUMPY_INCLUDE=$(dirname "$NUMPY_H")
-          SYSCONFIG_DIR=$(dirname "$SYSCONFIG")
-          SYSCONFIG_NAME=$(basename "$SYSCONFIG" .py)
-
-          echo "python_include=$PWD/$PYTHON_INCLUDE" >> "$GITHUB_OUTPUT"
-          echo "numpy_include=$PWD/$NUMPY_INCLUDE" >> "$GITHUB_OUTPUT"
-          echo "sysconfig_dir=$PWD/$SYSCONFIG_DIR" >> "$GITHUB_OUTPUT"
-          echo "sysconfig_name=$SYSCONFIG_NAME" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------
-      # 11. Create Meson cross-compilation file
+      # 7. Create Meson cross file
       # ------------------------------------------------------------
       - name: Create Meson cross file
         run: |
-          NDK_BIN="${{ github.workspace }}/termux-packages/build-tools/ndk-aarch64/bin"
+          NDK=$(find / -maxdepth 6 -iname 'android-ndk*' -type d 2>/dev/null | head -1)
+          echo "Detected NDK at: $NDK"
+          if [ -z "$NDK" ]; then
+            echo "::error::Could not auto-detect NDK directory - check container layout with 'find / -iname toolchains'"
+            exit 1
+          fi
 
-          cat > android-aarch64.cross <<EOF
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          CC="$TOOLCHAIN/bin/aarch64-linux-android${{ env.TERMUX_PKG_API_LEVEL }}-clang"
+          if [ ! -f "$CC" ]; then
+            echo "::error::Expected compiler not found at $CC - listing available clang binaries:"
+            find "$TOOLCHAIN/bin" -iname '*clang*' 2>/dev/null
+            exit 1
+          fi
+
+          cat > /tmp/cross-android.txt <<EOF
           [binaries]
-          c = '$NDK_BIN/clang'
-          cpp = '$NDK_BIN/clang++'
-          ar = '$NDK_BIN/llvm-ar'
-          strip = '$NDK_BIN/llvm-strip'
-          ranlib = '$NDK_BIN/llvm-ranlib'
+          c = '$CC'
+          cpp = '${CC}++'
+          ar = '$TOOLCHAIN/bin/llvm-ar'
+          strip = '$TOOLCHAIN/bin/llvm-strip'
+          ranlib = '$TOOLCHAIN/bin/llvm-ranlib'
+          pkgconfig = 'pkg-config'
 
           [host_machine]
           system = 'android'
@@ -209,148 +184,56 @@ jobs:
           needs_exe_wrapper = true
           EOF
 
-          cat android-aarch64.cross
+          cat /tmp/cross-android.txt
+          echo "ndk_toolchain=$TOOLCHAIN" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------
-      # 12. GATE: does pandas' build need a live `import numpy`
-      # during configure (vs. only referencing header paths)?
-      #
-      # This is a hard gate, not a warning. If meson.build or any
-      # setup script calls numpy.get_include() or otherwise imports
-      # numpy, the *build* Python (Ubuntu's) will resolve that
-      # import - CPATH has zero effect on Python import resolution.
-      # That means the build would silently succeed against the
-      # wrong NumPy ABI and only fail (or worse, segfault) on the
-      # actual Android device.
-      #
-      # We fail the job here on purpose. Proceeding past this point
-      # requires actually solving the problem - e.g. installing a
-      # matching numpy build for the *build* Python that exposes
-      # the same headers, or using a crossenv-style interpreter
-      # shim - not just hoping it's fine.
-      # ------------------------------------------------------------
-      - name: Gate on live numpy import in build config
-        working-directory: pandas-src
-        run: |
-          echo "========== meson.build files referencing numpy =========="
-          MESON_HITS=$(grep -rn "numpy" --include="meson.build" . || true)
-          echo "$MESON_HITS"
-
-          echo
-          echo "========== python files calling numpy at build time =========="
-          IMPORT_HITS=$(grep -rln "import numpy\|numpy\.get_include" . --include="*.py" || true)
-          echo "$IMPORT_HITS"
-
-          if echo "$MESON_HITS $IMPORT_HITS" | grep -qi "numpy"; then
-            echo
-            echo "::error::pandas' build references numpy at build time (get_include() or a live import)."
-            echo "::error::CPATH does NOT redirect 'import numpy' to the staged Android numpy - the build"
-            echo "::error::Python (Ubuntu's) will resolve this against whatever numpy is pip-installed here,"
-            echo "::error::which has the wrong ABI for Android/aarch64. Stopping before we produce a wheel"
-            echo "::error::that looks fine and breaks on-device."
-            echo "::error::Next step: install a build-Python-side numpy whose get_include() path is patched"
-            echo "::error::to point at the staged Android numpy headers, OR use a crossenv-style shim so the"
-            echo "::error::'numpy' import resolves to a stub exposing only the staged include path."
-            exit 1
-          else
-            echo "No build-time numpy import detected in meson.build or setup scripts."
-            echo "Headers should be resolved purely via CPATH - safe to proceed, but verify actual"
-            echo "compiler invocations in the next step's build log for '-I' paths as a sanity check."
-          fi
-
-      # ------------------------------------------------------------
-      # 13. Build pandas
+      # 8. Build pandas wheel
       # ------------------------------------------------------------
       - name: Build pandas wheel
-        working-directory: pandas-src
+        working-directory: /tmp/pandas-build
         env:
-          CPATH: >-
-            ${{ steps.paths.outputs.python_include }}:${{
-            steps.paths.outputs.numpy_include
-            }}
-          CFLAGS: "-fPIC"
-          CXXFLAGS: "-fPIC"
-          # NOTE: deliberately NOT setting _PYTHON_HOST_PLATFORM=linux-aarch64.
-          # Android/Bionic is not generic Linux/glibc - claiming "linux-aarch64"
-          # would tell Python's packaging machinery the wrong ABI family and
-          # could cause it to make incorrect assumptions downstream (symbol
-          # versioning, libc-specific codepaths). We rely on the meson cross
-          # file's [host_machine] system = 'android' for the actual compile,
-          # and leave interpreter-tag decisions until AFTER we've confirmed
-          # what got built - not before.
-          _PYTHON_SYSCONFIGDATA_NAME: ${{ steps.paths.outputs.sysconfig_name }}
+          CFLAGS: >-
+            -I${{ steps.paths.outputs.python_include }}
+            -I${{ steps.paths.outputs.numpy_include }}
+            -fPIC
+          CXXFLAGS: >-
+            -I${{ steps.paths.outputs.python_include }}
+            -I${{ steps.paths.outputs.numpy_include }}
+            -fPIC
+          LDFLAGS: >-
+            -L${{ steps.paths.outputs.target_dir }}/lib
           PYTHONPATH: ${{ steps.paths.outputs.sysconfig_dir }}
+          _PYTHON_SYSCONFIGDATA_NAME: ${{ steps.paths.outputs.sysconfig_name }}
         run: |
-          python3 -m pip install \
-            meson \
-            meson-python \
-            ninja \
-            cython \
-            wheel \
-            packaging \
-            setuptools-scm
+          pip3 install --upgrade pip build wheel setuptools-scm cython meson-python ninja
 
-          mkdir -p ../wheelhouse
+          mkdir -p /home/builder/wheelhouse
 
           python3 -m pip wheel \
             --no-deps \
             --no-build-isolation \
-            -Csetup-args=--cross-file=${{ github.workspace }}/android-aarch64.cross \
+            -Csetup-args=--cross-file=/tmp/cross-android.txt \
             . \
-            -w ../wheelhouse
+            -w /home/builder/wheelhouse
 
       # ------------------------------------------------------------
-      # 14. Inspect the generated wheel
-      # ------------------------------------------------------------
-      - name: Inspect pandas wheel
-        run: |
-          echo "========== Wheel =========="
-          ls -lh wheelhouse/
-
-          echo
-          echo "========== Native extensions =========="
-          unzip -l wheelhouse/*.whl \
-            | grep -E '\.so$' || true
-
-          echo
-          echo "========== Python ABI (pre-retag) =========="
-          unzip -l wheelhouse/*.whl \
-            | grep -E 'cpython-[0-9]+' || true
-
-      # ------------------------------------------------------------
-      # 15. Verify the wheel's actual ABI before touching its tag
-      #
-      # We deliberately do NOT retag here. A wheel tag is metadata -
-      # renaming the file doesn't change what the .so inside is
-      # actually linked against. If the extensions were built with
-      # the wrong headers/ABI (e.g. because step 12's gate was
-      # somehow bypassed, or CPATH resolution silently fell back to
-      # host paths), retagging would produce a wheel that *claims*
-      # to be Android-native and crashes on import.
-      #
-      # Instead: inspect what got built, confirm it's genuinely
-      # ARM/Android-linked, and only decide the correct tag once
-      # that's verified. Retagging becomes a separate, deliberate
-      # step you run after reading this output - not an automatic
-      # part of the pipeline.
+      # 9. Verify actual ABI - no auto-retagging. Confirm the .so
+      # files are genuinely ARM/Android before any tag decision.
       # ------------------------------------------------------------
       - name: Verify wheel ABI before any tagging decision
         run: |
-          cd wheelhouse
-          WHL=$(ls pandas-*.whl)
+          cd /home/builder/wheelhouse
+          WHL=$(ls pandas-*.whl | head -1)
           echo "Wheel produced: $WHL"
-          echo "Filename tag (this is the BUILD python's tag, not necessarily correct): "
-          echo "$WHL" | grep -oE 'cp[0-9]+-[^-]+-[^.]+' || true
 
-          echo
-          echo "========== Extracting to inspect real .so linkage =========="
-          rm -rf _inspect
-          mkdir _inspect
-          unzip -q "$WHL" -d _inspect
+          rm -rf /tmp/inspect
+          mkdir -p /tmp/inspect
+          unzip -q "$WHL" -d /tmp/inspect
 
-          SO_FILES=$(find _inspect -name '*.so' | head -5)
+          SO_FILES=$(find /tmp/inspect -name '*.so' | head -5)
           if [ -z "$SO_FILES" ]; then
-            echo "::error::No .so files found in wheel - build likely produced a pure-python-only wheel, which is wrong for pandas."
+            echo "::error::No .so files in wheel - pandas requires native extensions, this wheel is wrong"
             exit 1
           fi
 
@@ -361,61 +244,23 @@ jobs:
           done
 
           echo
-          echo "Expect: ELF 64-bit LSB shared object, ARM aarch64"
-          echo "If 'file' instead reports x86-64, the build linked against the WRONG toolchain"
-          echo "despite the cross file - do not proceed to tagging or shipping this wheel."
-          echo
-          echo "Once you've confirmed ARM/aarch64 linkage above, the correct tag is a manual,"
-          echo "informed decision (e.g. via 'python -m wheel tags'), not an automatic step here."
+          echo "Expect: ELF 64-bit LSB shared object, ARM aarch64."
+          echo "If 'file' reports x86-64 instead, the cross file was not honored - stop here,"
+          echo "do not tag or ship this wheel. Tagging is a manual step you run after confirming this."
 
       # ------------------------------------------------------------
-      # 16. Extract wheel
+      # 10. Package artifacts (untagged wheel + inspection output)
       # ------------------------------------------------------------
-      - name: Extract pandas
+      - name: Package artifacts
         run: |
-          rm -rf artifact
-          mkdir artifact
+          mkdir -p /tmp/artifact
+          cp /home/builder/wheelhouse/*.whl /tmp/artifact/
+          cd /tmp/artifact
+          zip -r /home/builder/pandas-termux-aarch64.zip .
 
-          unzip -q wheelhouse/*.whl \
-            -d artifact
-
-      # ------------------------------------------------------------
-      # 17. Show the final native modules
-      # ------------------------------------------------------------
-      - name: Verify native modules
-        run: |
-          echo "========== pandas .so files =========="
-          find artifact/pandas \
-            -type f \
-            -name '*.so' \
-            -print
-
-          echo
-          echo "========== File information =========="
-          find artifact/pandas \
-            -type f \
-            -name '*.so' \
-            -exec file {} \;
-
-      # ------------------------------------------------------------
-      # 18. Package everything
-      # ------------------------------------------------------------
-      - name: Create pandas-android.zip
-        run: |
-          cd artifact
-          zip -r ../pandas-android.zip .
-          cd ..
-
-          echo
-          echo "========== Final artifact =========="
-          ls -lh pandas-android.zip
-
-      # ------------------------------------------------------------
-      # 19. Upload ZIP to GitHub Actions
-      # ------------------------------------------------------------
-      - name: Upload pandas Android ZIP
+      - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pandas-android
-          path: pandas-android.zip
+          name: pandas-termux-aarch64
+          path: /home/builder/pandas-termux-aarch64.zip
           if-no-files-found: error
